@@ -139,7 +139,15 @@ export async function POST(request: NextRequest) {
 
     return withSession(
       NextResponse.json(
-        { success: true, reportId: savedReportId ?? reportId, analysisResult },
+        {
+          success:   true,
+          reportId:  savedReportId ?? reportId,
+          // dbSaved tells the client whether the report was persisted to the
+          // database. When false (DB disabled, save error, or missing migration)
+          // the client should redirect to /results/preview instead of /results/[id].
+          dbSaved:   savedReportId !== undefined,
+          analysisResult,
+        },
         { status: 200 },
       ),
     );

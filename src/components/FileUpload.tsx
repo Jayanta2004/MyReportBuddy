@@ -121,9 +121,13 @@ export default function FileUpload() {
       toast({ title: '✓ Analysis complete!', description: 'Redirecting to your results…' });
       sessionStorage.setItem('analysisResult', JSON.stringify(data));
       sessionStorage.setItem('reportFileName', entries.map((e) => e.file.name).join(', '));
-      setTimeout(() => {
-        router.push(data.reportId ? `/results/${data.reportId}` : '/results/preview');
-      }, 500);
+      // Only go to the DB-backed results page when the report was actually saved.
+      // If the DB is unavailable (or the session_id migration hasn't been run yet)
+      // fall back to the preview page which reads directly from sessionStorage.
+      const destination = data.dbSaved && data.reportId
+        ? `/results/${data.reportId}`
+        : '/results/preview';
+      setTimeout(() => router.push(destination), 500);
     } catch (err) {
       clearInterval(progressInterval);
       setProgress(0);
