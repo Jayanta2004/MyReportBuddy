@@ -32,10 +32,15 @@ export async function processPDF(
         : extractedText;
 
     return { type: 'pdf', content: truncated, mimeType: 'application/pdf', fileName };
-  } catch (err) {
-    throw new Error(
-      `Failed to parse PDF: ${err instanceof Error ? err.message : 'Unknown error'}`,
-    );
+  } catch {
+    // pdf-parse failed (non-standard structure, bad XRef, password-protected, etc.)
+    // Fall back to GPT-4o Vision — it handles these PDFs reliably.
+    return {
+      type:     'image',
+      content:  fileBuffer.toString('base64'),
+      mimeType: 'application/pdf',
+      fileName,
+    };
   }
 }
 
