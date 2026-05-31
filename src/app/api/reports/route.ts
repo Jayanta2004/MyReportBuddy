@@ -1,12 +1,23 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSupabase, isDbEnabled } from '@/lib/supabase';
+import { getSessionId } from '@/lib/session';
 
 export async function GET(request: NextRequest) {
   if (!isDbEnabled()) {
     return NextResponse.json(
       { error: 'Database not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY to enable history.' },
-      { status: 503 }
+      { status: 503 },
     );
+  }
+
+  // Only return reports that belong to this browser session.
+  // If there is no session cookie the user has no history yet — return an empty list.
+  const sessionId = getSessionId(request);
+  if (!sessionId) {
+    return NextResponse.json({
+      reports:    [],
+      pagination: { total: 0, page: 1, limit: 10, totalPages: 0 },
+    });
   }
 
   const supabase = getSupabase()!;
@@ -21,6 +32,7 @@ export async function GET(request: NextRequest) {
     const { data, error, count } = await supabase
       .from('reports')
       .select('id, file_name, file_type, file_size, uploaded_at, processed_at, status, report_type', { count: 'exact' })
+      .eq('session_id', sessionId)
       .eq('status', 'COMPLETED')
       .order('uploaded_at', { ascending: false })
       .range(from, to);

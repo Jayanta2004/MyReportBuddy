@@ -3,6 +3,7 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 /* ── Types ─────────────────────────────────────────────────────── */
 export interface DbReport {
   id: string;
+  session_id: string | null;
   file_name: string;
   file_type: string;
   file_size: number;

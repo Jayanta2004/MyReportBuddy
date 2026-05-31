@@ -95,7 +95,7 @@ export default function HistoryPage() {
             <div>
               <p className="text-xs font-semibold uppercase tracking-widest text-primary mb-1">History</p>
               <h1 className="text-3xl font-extrabold text-slate-900 dark:text-white">Report History</h1>
-              <p className="text-slate-500 dark:text-slate-400 mt-1 text-sm">Your previously analysed medical reports</p>
+              <p className="text-slate-500 dark:text-slate-400 mt-1 text-sm">Reports analysed in this browser session</p>
             </div>
             <Button asChild className="rounded-xl">
               <Link href="/upload">

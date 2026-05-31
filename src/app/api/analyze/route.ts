@@ -4,6 +4,7 @@ import { checkRateLimit } from '@/lib/rate-limiter';
 import { processUploadedFile } from '@/lib/pdf-parser';
 import { analyzeReport } from '@/lib/openai';
 import { getSupabase, isDbEnabled } from '@/lib/supabase';
+import { getSessionId, generateSessionId, SESSION_COOKIE, SESSION_MAX_AGE } from '@/lib/session';
 import { ProcessedFile } from '@/types';
 
 const ALLOWED_MIME_TYPES = new Set([
@@ -13,8 +14,8 @@ const ALLOWED_MIME_TYPES = new Set([
   'image/webp',
 ]);
 
-const MAX_FILE_SIZE     = 10 * 1024 * 1024; // 10 MB per file
-const MAX_FILES         = 5;
+const MAX_FILE_SIZE      = 10 * 1024 * 1024; // 10 MB per file
+const MAX_FILES          = 5;
 const MAX_CONTEXT_LENGTH = 2000;             // chars for user description
 
 export async function POST(request: NextRequest) {
@@ -27,6 +28,10 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  // Resolve session — use existing cookie or mint a new one
+  const existingSessionId = getSessionId(request);
+  const sessionId         = existingSessionId ?? generateSessionId();
+
   // Parse multipart form data
   let formData: FormData;
   try {
@@ -36,9 +41,9 @@ export async function POST(request: NextRequest) {
   }
 
   // Support both 'files' (multiple) and legacy 'file' (single)
-  const rawFiles    = formData.getAll('files') as File[];
-  const legacyFile  = formData.get('file') as File | null;
-  const files       = rawFiles.length > 0 ? rawFiles : legacyFile ? [legacyFile] : [];
+  const rawFiles   = formData.getAll('files') as File[];
+  const legacyFile = formData.get('file') as File | null;
+  const files      = rawFiles.length > 0 ? rawFiles : legacyFile ? [legacyFile] : [];
 
   if (files.length === 0) {
     return NextResponse.json({ error: 'No file(s) provided.' }, { status: 400 });
@@ -75,6 +80,20 @@ export async function POST(request: NextRequest) {
 
   const reportId = uuidv4();
 
+  /** Helper — attach the session cookie and return a response. */
+  function withSession(response: NextResponse): NextResponse {
+    response.cookies.set({
+      name:     SESSION_COOKIE,
+      value:    sessionId,
+      httpOnly: true,
+      sameSite: 'lax',
+      secure:   process.env.NODE_ENV === 'production',
+      maxAge:   SESSION_MAX_AGE,
+      path:     '/',
+    });
+    return response;
+  }
+
   try {
     // Process files entirely in memory — no disk writes
     const isMultiFile      = files.length > 1;
@@ -99,6 +118,7 @@ export async function POST(request: NextRequest) {
           .from('reports')
           .insert({
             id:              reportId,
+            session_id:      sessionId,
             file_name:       files.map((f) => f.name).join(', '),
             file_type:       files.length > 1 ? 'multiple' : files[0].type,
             file_size:       files.reduce((sum, f) => sum + f.size, 0),
@@ -117,9 +137,11 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    return NextResponse.json(
-      { success: true, reportId: savedReportId ?? reportId, analysisResult },
-      { status: 200 },
+    return withSession(
+      NextResponse.json(
+        { success: true, reportId: savedReportId ?? reportId, analysisResult },
+        { status: 200 },
+      ),
     );
   } catch (error) {
     console.error('Analysis error:', error);
@@ -131,6 +153,7 @@ export async function POST(request: NextRequest) {
         const supabase = getSupabase()!;
         await supabase.from('reports').insert({
           id:            reportId,
+          session_id:    sessionId,
           file_name:     files.map((f) => f.name).join(', '),
           file_type:     files.length > 1 ? 'multiple' : (files[0]?.type ?? 'unknown'),
           file_size:     files.reduce((sum, f) => sum + f.size, 0),
