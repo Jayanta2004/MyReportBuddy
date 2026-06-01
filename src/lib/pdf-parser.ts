@@ -6,149 +6,170 @@ const SINGLE_FILE_CHAR_LIMIT = 12000;
 const MULTI_FILE_CHAR_LIMIT  = 6000;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helpers
+// Shared helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Decode PDF literal string escape sequences into plain text. */
+/** Decode PDF literal-string escape sequences into readable text. */
 function decodePdfLiteral(raw: string): string {
   return raw
     .replace(/\\n/g, ' ')
     .replace(/\\r/g, ' ')
     .replace(/\\t/g, '\t')
-    .replace(/\\\\/g, '\x00BACKSLASH\x00')          // protect escaped backslash
+    // Octal escapes like \101 → 'A'
     .replace(/\\([0-7]{1,3})/g, (_, oct) => {
       const code = parseInt(oct, 8);
       return code >= 32 && code < 127 ? String.fromCharCode(code) : ' ';
     })
-    .replace(/\\(.)/g, '$1')
-    .replace(/\x00BACKSLASH\x00/g, '\\');
+    .replace(/\\\\/g, '\\')
+    .replace(/\\(.)/g, '$1');
 }
 
-/** Extract visible text strings from a single PDF content stream. */
-function parseStreamText(stream: string): string[] {
-  const parts: string[] = [];
-  const LITERAL_RE = /\(([^)\\]*(?:\\.[^)\\]*)*)\)/g;
+/** True if a decoded PDF string looks like real text (not binary noise). */
+function looksLikeText(s: string): boolean {
+  if (s.length < 3) return false;
+  const printable = s.split('').filter(
+    (c) => c.charCodeAt(0) >= 32 && c.charCodeAt(0) < 127,
+  ).length;
+  return printable / s.length > 0.6 && /[a-zA-Z0-9]/.test(s);
+}
 
-  const btEtRe = /BT\b([\s\S]*?)\bET\b/g;
+/** Extract text items from a single content stream (BT…ET operators). */
+function parseStreamText(data: string): string[] {
+  const out: string[] = [];
+  const LITERAL = /\(([^)\\]*(?:\\.[^)\\]*)*)\)/g;
+  const btEt    = /BT\b([\s\S]*?)\bET\b/g;
   let block: RegExpExecArray | null;
 
-  while ((block = btEtRe.exec(stream)) !== null) {
+  while ((block = btEt.exec(data)) !== null) {
     const body = block[1];
 
-    // Simple: (text) Tj | (text) ' | (text) "
+    // (text) Tj | (text) ' | (text) "
     const simpleRe = /\(([^)\\]*(?:\\.[^)\\]*)*)\)\s*(?:Tj|'|")/g;
     let m: RegExpExecArray | null;
     while ((m = simpleRe.exec(body)) !== null) {
       const s = decodePdfLiteral(m[1]).trim();
-      if (s) parts.push(s);
+      if (s) out.push(s);
     }
 
-    // Array: [(text) n (text) ...] TJ
+    // [(text) n (text)] TJ
     const tjRe = /\[([^\]]*)\]\s*TJ/g;
     while ((m = tjRe.exec(body)) !== null) {
-      LITERAL_RE.lastIndex = 0;
+      LITERAL.lastIndex = 0;
       let lit: RegExpExecArray | null;
-      while ((lit = LITERAL_RE.exec(m[1])) !== null) {
+      while ((lit = LITERAL.exec(m[1])) !== null) {
         const s = decodePdfLiteral(lit[1]).trim();
-        if (s) parts.push(s);
+        if (s) out.push(s);
       }
     }
   }
-
-  return parts;
+  return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Extractor 1 — Built-in (Node.js zlib only, zero external deps)
+// Layer 1 — Stream-based extractor (Node.js zlib, zero external deps)
 //
-// Scans every stream/endstream block in the PDF binary, decompresses
-// FlateDecode streams with the built-in zlib module, then extracts
-// text from BT…ET operators.
-//
-// This works in all environments including Vercel serverless functions
-// because it uses only Node.js built-ins — nothing gets webpack-bundled.
+// Locates every stream/endstream block, decompresses FlateDecode streams,
+// then extracts text from BT…ET operators.
+// Handles all line-ending variants (\n, \r\n, \r).
 // ─────────────────────────────────────────────────────────────────────────────
 async function extractBuiltin(buffer: Buffer): Promise<string> {
   try {
-    // Latin-1 encoding preserves raw byte values (0x00–0xFF) correctly
-    const raw      = buffer.toString('latin1');
-    const allParts: string[] = [];
+    const raw  = buffer.toString('latin1');
+    const parts: string[] = [];
 
-    // Locate every stream…endstream block.
-    // Look back up to 600 chars before "stream" to find the /Filter entry.
-    const streamRe = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
+    // Flexible line endings: stream may end with \n, \r\n, or \r
+    const streamRe = /stream[\r\n]+([\s\S]*?)[\r\n]+endstream/g;
     let m: RegExpExecArray | null;
 
     while ((m = streamRe.exec(raw)) !== null) {
-      const prelude  = raw.slice(Math.max(0, m.index - 600), m.index);
+      // Look back up to 512 chars to find /Filter entry in the dict
+      const prelude  = raw.slice(Math.max(0, m.index - 512), m.index);
       const rawBytes = Buffer.from(m[1], 'latin1');
 
       const isFlate  = /\/FlateDecode/.test(prelude) ||
                        /\/Filter\s*\/Fl/.test(prelude);
 
-      let streamText: string;
-
+      let content: string;
       if (isFlate) {
-        // PDF FlateDecode = zlib format (inflate) with raw-deflate as fallback
-        try {
-          streamText = inflateSync(rawBytes).toString('latin1');
-        } catch {
-          try {
-            streamText = inflateRawSync(rawBytes).toString('latin1');
-          } catch {
-            continue; // unreadable compressed stream — skip
-          }
+        try       { content = inflateSync(rawBytes).toString('latin1'); }
+        catch     {
+          try     { content = inflateRawSync(rawBytes).toString('latin1'); }
+          catch   { continue; }
         }
       } else {
-        streamText = rawBytes.toString('latin1');
+        content = rawBytes.toString('latin1');
       }
 
-      allParts.push(...parseStreamText(streamText));
+      parts.push(...parseStreamText(content));
     }
 
-    return allParts.join(' ').trim();
+    return parts.join(' ').trim();
   } catch {
     return '';
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Extractor 2 — pdfjs-dist v3 (handles malformed XRef, non-standard PDFs)
-// Uses dynamic import so it works in both CJS (dev) and ESM (Vercel prod).
+// Layer 2 — Raw literal-string scan (ultimate fallback, zero deps)
+//
+// Scans the ENTIRE PDF binary for every (text) token — no stream structure
+// required.  Works for any uncompressed content regardless of XRef table
+// validity, stream format, or producer.  Filters out binary noise by checking
+// the ratio of printable ASCII characters.
+// ─────────────────────────────────────────────────────────────────────────────
+async function extractRawScan(buffer: Buffer): Promise<string> {
+  try {
+    const raw  = buffer.toString('latin1');
+    const parts: string[] = [];
+
+    // Match all PDF literal strings: (anything not unescaped-closing-paren)
+    const re = /\(([^)\\]{2,}(?:\\.[^)\\]*)*)\)/g;
+    let m: RegExpExecArray | null;
+
+    while ((m = re.exec(raw)) !== null) {
+      const decoded = decodePdfLiteral(m[1]).trim();
+      if (looksLikeText(decoded)) parts.push(decoded);
+    }
+
+    return parts.join(' ').trim();
+  } catch {
+    return '';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Layer 3 — pdfjs-dist v3  (handles malformed XRef, complex PDFs)
+// Dynamic import works in both CJS dev mode and ESM Vercel production.
 // ─────────────────────────────────────────────────────────────────────────────
 async function extractWithPdfjs(buffer: Buffer): Promise<string> {
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const mod   = await import('pdfjs-dist/legacy/build/pdf.js') as any;
     const pdfjs = mod.default ?? mod;
-
     if (typeof pdfjs?.getDocument !== 'function') return '';
 
     pdfjs.GlobalWorkerOptions.workerSrc = '';
 
-    const pdf = await pdfjs
+    const pdf  = await pdfjs
       .getDocument({ data: new Uint8Array(buffer), useSystemFonts: true, disableFontFace: true })
       .promise;
 
-    const numPages = Math.min(pdf.numPages, 50);
-    const parts: string[] = [];
-
-    for (let p = 1; p <= numPages; p++) {
+    const pages: string[] = [];
+    for (let p = 1; p <= Math.min(pdf.numPages, 50); p++) {
       const page    = await pdf.getPage(p);
       const content = await page.getTextContent();
-      const text    = (content.items as Array<{ str?: string }>)
-        .map((item) => item.str ?? '').join(' ');
-      parts.push(text);
+      pages.push(
+        (content.items as Array<{ str?: string }>).map((i) => i.str ?? '').join(' '),
+      );
     }
-
-    return parts.join('\n').trim();
+    return pages.join('\n').trim();
   } catch {
     return '';
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Extractor 3 — pdf-parse (original fallback)
+// Layer 4 — pdf-parse (original library, last resort)
 // ─────────────────────────────────────────────────────────────────────────────
 async function extractWithPdfParse(buffer: Buffer): Promise<string> {
   try {
@@ -169,15 +190,13 @@ export async function processPDF(
   fileName:   string,
   charLimit = SINGLE_FILE_CHAR_LIMIT,
 ): Promise<ProcessedFile> {
-  // Run all three extractors in priority order, stop as soon as one succeeds
-  let text = await extractBuiltin(fileBuffer);
+  // Try each layer in order; stop as soon as one yields ≥ 50 chars
+  const layers = [extractBuiltin, extractRawScan, extractWithPdfjs, extractWithPdfParse];
 
-  if (!text || text.length < 50) {
-    text = await extractWithPdfjs(fileBuffer);
-  }
-
-  if (!text || text.length < 50) {
-    text = await extractWithPdfParse(fileBuffer);
+  let text = '';
+  for (const extract of layers) {
+    text = await extract(fileBuffer);
+    if (text && text.length >= 50) break;
   }
 
   if (text && text.length >= 50) {
@@ -187,8 +206,8 @@ export async function processPDF(
     return { type: 'pdf', content, mimeType: 'application/pdf', fileName };
   }
 
-  // All extractors failed — scanned / image-only PDF.
-  // openai.ts sends a graceful text notice instead of calling Vision API.
+  // All layers failed — scanned / image-only PDF.
+  // openai.ts sends a graceful notice instead of crashing the Vision API.
   return {
     type:     'image',
     content:  fileBuffer.toString('base64'),
@@ -212,12 +231,7 @@ export async function processUploadedFile(
   isMultiFile = false,
 ): Promise<ProcessedFile> {
   const charLimit = isMultiFile ? MULTI_FILE_CHAR_LIMIT : SINGLE_FILE_CHAR_LIMIT;
-
-  if (mimeType === 'application/pdf') {
-    return processPDF(fileBuffer, fileName, charLimit);
-  } else if (mimeType.startsWith('image/')) {
-    return processImage(fileBuffer, mimeType, fileName);
-  } else {
-    throw new Error(`Unsupported file type: ${mimeType}`);
-  }
+  if (mimeType === 'application/pdf')  return processPDF(fileBuffer, fileName, charLimit);
+  if (mimeType.startsWith('image/'))   return processImage(fileBuffer, mimeType, fileName);
+  throw new Error(`Unsupported file type: ${mimeType}`);
 }
