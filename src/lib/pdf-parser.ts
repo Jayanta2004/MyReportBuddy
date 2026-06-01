@@ -11,8 +11,11 @@ const MULTI_FILE_CHAR_LIMIT  = 6000;
 // ---------------------------------------------------------------------------
 async function extractWithPdfjs(buffer: Buffer): Promise<string> {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-explicit-any
-    const pdfjs = require('pdfjs-dist/legacy/build/pdf.js') as any;
+    // Dynamic import works in both CJS (local dev) and ESM (Vercel production).
+    // require() is NOT available in ESM — using import() avoids that pitfall.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mod   = await import('pdfjs-dist/legacy/build/pdf.js') as any;
+    const pdfjs = mod.default ?? mod;
 
     // Disable the browser worker — text extraction runs inline in Node.js
     pdfjs.GlobalWorkerOptions.workerSrc = '';
