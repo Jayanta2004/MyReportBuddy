@@ -1,4 +1,4 @@
-import OpenAI, { toFile } from 'openai';
+import OpenAI from 'openai';
 import { AnalysisResult, ProcessedFile } from '@/types';
 
 const openai = new OpenAI({
@@ -38,9 +38,6 @@ export async function analyzeReport(
   // Build the content array for the user message
   const contentParts: OpenAI.Chat.ChatCompletionContentPart[] = [];
 
-  // Track any files uploaded to OpenAI's Files API so we can delete them afterwards
-  const uploadedFileIds: string[] = [];
-
   // Add user context / symptoms at the top if provided
   if (userContext && userContext.trim().length > 0) {
     contentParts.push({
@@ -68,18 +65,15 @@ export async function analyzeReport(
       });
 
       if (file.mimeType === 'application/pdf') {
-        // PDF vision fallback — OpenAI's image_url does NOT accept application/pdf.
-        // Instead, upload the PDF to the Files API and reference it by file_id.
-        const pdfBuffer = Buffer.from(file.content, 'base64');
-        const fileObj   = await toFile(pdfBuffer, file.fileName, { type: 'application/pdf' });
-        const uploaded  = await openai.files.create({ file: fileObj, purpose: 'vision' });
-        uploadedFileIds.push(uploaded.id);
-
-        // Reference the uploaded file in the message content
+        // This PDF is scanned / image-only — text extraction returned nothing.
+        // OpenAI Vision does NOT accept application/pdf in image_url or Files API
+        // (purpose: 'vision' only supports image formats).
+        // Inject a plain-text notice so the AI can return a helpful JSON response
+        // instead of crashing with a 400 error.
         contentParts.push({
-          type: 'file',
-          file: { file_id: uploaded.id },
-        } as unknown as OpenAI.Chat.ChatCompletionContentPart);
+          type: 'text',
+          text: `[SYSTEM NOTE: "${file.fileName}" is a scanned or image-only PDF. Automated text extraction produced no output, and the OpenAI Vision API does not accept PDF files directly. In your JSON response, set report_type to "Unreadable Document", set patient_name to null, and use the summary field to politely explain that this PDF could not be processed — advising the user to convert the pages to JPG or PNG images and re-upload for a full visual analysis.]`,
+        });
       } else {
         // Standard image (jpeg / png / webp) — use inline base64 data URL
         contentParts.push({
@@ -104,32 +98,25 @@ export async function analyzeReport(
     text: '\nPlease analyze the above and return the structured JSON analysis.',
   });
 
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o',
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: contentParts },
+    ],
+    max_tokens: 4096,
+    temperature: 0.1,
+    response_format: { type: 'json_object' },
+  });
+
+  const content = response.choices[0]?.message?.content;
+  if (!content) {
+    throw new Error('No response from OpenAI');
+  }
+
   try {
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: contentParts },
-      ],
-      max_tokens: 4096,
-      temperature: 0.1,
-      response_format: { type: 'json_object' },
-    });
-
-    const content = response.choices[0]?.message?.content;
-    if (!content) {
-      throw new Error('No response from OpenAI');
-    }
-
-    try {
-      return JSON.parse(content) as AnalysisResult;
-    } catch {
-      throw new Error('Failed to parse AI response as JSON');
-    }
-  } finally {
-    // Always clean up any files we uploaded — fire-and-forget, never block the response
-    for (const fileId of uploadedFileIds) {
-      openai.files.del(fileId).catch(() => {});
-    }
+    return JSON.parse(content) as AnalysisResult;
+  } catch {
+    throw new Error('Failed to parse AI response as JSON');
   }
 }
