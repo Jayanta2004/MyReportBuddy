@@ -9,31 +9,27 @@ const MULTI_FILE_CHAR_LIMIT  = 6000;
 // Shared helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Decode PDF literal-string escape sequences into readable text. */
+/** Decode PDF literal-string escape sequences to plain text. */
 function decodePdfLiteral(raw: string): string {
   return raw
     .replace(/\\n/g, ' ')
     .replace(/\\r/g, ' ')
     .replace(/\\t/g, '\t')
-    // Octal escapes like \101 → 'A'
+    // Octal escape \ddd
     .replace(/\\([0-7]{1,3})/g, (_, oct) => {
       const code = parseInt(oct, 8);
       return code >= 32 && code < 127 ? String.fromCharCode(code) : ' ';
     })
-    .replace(/\\\\/g, '\\')
-    .replace(/\\(.)/g, '$1');
+    .replace(/\\\\/g, '\x01BKSL\x01')   // protect \\
+    .replace(/\\(.)/g, '$1')
+    .replace(/\x01BKSL\x01/g, '\\');
 }
 
-/** True if a decoded PDF string looks like real text (not binary noise). */
-function looksLikeText(s: string): boolean {
-  if (s.length < 3) return false;
-  const printable = s.split('').filter(
-    (c) => c.charCodeAt(0) >= 32 && c.charCodeAt(0) < 127,
-  ).length;
-  return printable / s.length > 0.6 && /[a-zA-Z0-9]/.test(s);
-}
-
-/** Extract text items from a single content stream (BT…ET operators). */
+/**
+ * Extract text from a single uncompressed PDF content stream.
+ * Only reads inside BT … ET blocks — this excludes font definitions,
+ * encoding tables, and all non-text metadata.
+ */
 function parseStreamText(data: string): string[] {
   const out: string[] = [];
   const LITERAL = /\(([^)\\]*(?:\\.[^)\\]*)*)\)/g;
@@ -44,9 +40,9 @@ function parseStreamText(data: string): string[] {
     const body = block[1];
 
     // (text) Tj | (text) ' | (text) "
-    const simpleRe = /\(([^)\\]*(?:\\.[^)\\]*)*)\)\s*(?:Tj|'|")/g;
+    const simple = /\(([^)\\]*(?:\\.[^)\\]*)*)\)\s*(?:Tj|'|")/g;
     let m: RegExpExecArray | null;
-    while ((m = simpleRe.exec(body)) !== null) {
+    while ((m = simple.exec(body)) !== null) {
       const s = decodePdfLiteral(m[1]).trim();
       if (s) out.push(s);
     }
@@ -66,38 +62,50 @@ function parseStreamText(data: string): string[] {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Layer 1 — Stream-based extractor (Node.js zlib, zero external deps)
+// Layer 1 — /Length-based stream extractor  (Node.js zlib only, zero deps)
 //
-// Locates every stream/endstream block, decompresses FlateDecode streams,
-// then extracts text from BT…ET operators.
-// Handles all line-ending variants (\n, \r\n, \r).
+// Reads the /Length integer from each stream dictionary and slices exactly
+// that many bytes from the buffer — avoids the problem where a regex can
+// accidentally match "endstream" bytes inside compressed binary data.
+// Decompresses FlateDecode streams with the built-in zlib module.
 // ─────────────────────────────────────────────────────────────────────────────
 async function extractBuiltin(buffer: Buffer): Promise<string> {
   try {
-    const raw  = buffer.toString('latin1');
+    // latin1 preserves raw byte values 0x00–0xFF (1 byte = 1 char)
+    const raw   = buffer.toString('latin1');
     const parts: string[] = [];
 
-    // Flexible line endings: stream may end with \n, \r\n, or \r
-    const streamRe = /stream[\r\n]+([\s\S]*?)[\r\n]+endstream/g;
+    // Locate every "stream\n" or "stream\r\n" marker
+    const markerRe = /stream\r?\n/g;
     let m: RegExpExecArray | null;
 
-    while ((m = streamRe.exec(raw)) !== null) {
-      // Look back up to 512 chars to find /Filter entry in the dict
-      const prelude  = raw.slice(Math.max(0, m.index - 512), m.index);
-      const rawBytes = Buffer.from(m[1], 'latin1');
+    while ((m = markerRe.exec(raw)) !== null) {
+      // Find the /Length integer in the preceding dict (look back 512 chars)
+      const prelude = raw.slice(Math.max(0, m.index - 512), m.index);
 
-      const isFlate  = /\/FlateDecode/.test(prelude) ||
-                       /\/Filter\s*\/Fl/.test(prelude);
+      const lenMatch = /\/Length\s+(\d+)/.exec(prelude);
+      if (!lenMatch) continue;
+
+      const streamLen = parseInt(lenMatch[1], 10);
+      if (!streamLen || streamLen <= 0) continue;
+
+      // Slice exactly /Length bytes from the buffer (not the string)
+      // latin1 is 1-byte-per-char so string index === buffer byte index
+      const contentStart = m.index + m[0].length;
+      const streamBytes  = buffer.slice(contentStart, contentStart + streamLen);
+
+      const isFlate = /\/FlateDecode/.test(prelude) ||
+                      /\/Filter\s*\/Fl/.test(prelude);
 
       let content: string;
       if (isFlate) {
-        try       { content = inflateSync(rawBytes).toString('latin1'); }
+        try       { content = inflateSync(streamBytes).toString('latin1'); }
         catch     {
-          try     { content = inflateRawSync(rawBytes).toString('latin1'); }
+          try     { content = inflateRawSync(streamBytes).toString('latin1'); }
           catch   { continue; }
         }
       } else {
-        content = rawBytes.toString('latin1');
+        content = streamBytes.toString('latin1');
       }
 
       parts.push(...parseStreamText(content));
@@ -110,27 +118,17 @@ async function extractBuiltin(buffer: Buffer): Promise<string> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Layer 2 — Raw literal-string scan (ultimate fallback, zero deps)
+// Layer 2 — Raw BT/ET scan  (zero deps, catches uncompressed content)
 //
-// Scans the ENTIRE PDF binary for every (text) token — no stream structure
-// required.  Works for any uncompressed content regardless of XRef table
-// validity, stream format, or producer.  Filters out binary noise by checking
-// the ratio of printable ASCII characters.
+// Scans the raw PDF binary for BT … ET blocks.
+// By limiting extraction to BT/ET blocks (not ALL "(string)" tokens),
+// we avoid picking up font definitions, encoding tables, or other metadata
+// that would produce garbage text and confuse the AI.
 // ─────────────────────────────────────────────────────────────────────────────
-async function extractRawScan(buffer: Buffer): Promise<string> {
+async function extractRawBtEt(buffer: Buffer): Promise<string> {
   try {
-    const raw  = buffer.toString('latin1');
-    const parts: string[] = [];
-
-    // Match all PDF literal strings: (anything not unescaped-closing-paren)
-    const re = /\(([^)\\]{2,}(?:\\.[^)\\]*)*)\)/g;
-    let m: RegExpExecArray | null;
-
-    while ((m = re.exec(raw)) !== null) {
-      const decoded = decodePdfLiteral(m[1]).trim();
-      if (looksLikeText(decoded)) parts.push(decoded);
-    }
-
+    const raw   = buffer.toString('latin1');
+    const parts = parseStreamText(raw);   // reuses BT/ET-only logic
     return parts.join(' ').trim();
   } catch {
     return '';
@@ -139,7 +137,6 @@ async function extractRawScan(buffer: Buffer): Promise<string> {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Layer 3 — pdfjs-dist v3  (handles malformed XRef, complex PDFs)
-// Dynamic import works in both CJS dev mode and ESM Vercel production.
 // ─────────────────────────────────────────────────────────────────────────────
 async function extractWithPdfjs(buffer: Buffer): Promise<string> {
   try {
@@ -149,7 +146,6 @@ async function extractWithPdfjs(buffer: Buffer): Promise<string> {
     if (typeof pdfjs?.getDocument !== 'function') return '';
 
     pdfjs.GlobalWorkerOptions.workerSrc = '';
-
     const pdf  = await pdfjs
       .getDocument({ data: new Uint8Array(buffer), useSystemFonts: true, disableFontFace: true })
       .promise;
@@ -169,7 +165,7 @@ async function extractWithPdfjs(buffer: Buffer): Promise<string> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Layer 4 — pdf-parse (original library, last resort)
+// Layer 4 — pdf-parse  (original library, last resort)
 // ─────────────────────────────────────────────────────────────────────────────
 async function extractWithPdfParse(buffer: Buffer): Promise<string> {
   try {
@@ -190,8 +186,13 @@ export async function processPDF(
   fileName:   string,
   charLimit = SINGLE_FILE_CHAR_LIMIT,
 ): Promise<ProcessedFile> {
-  // Try each layer in order; stop as soon as one yields ≥ 50 chars
-  const layers = [extractBuiltin, extractRawScan, extractWithPdfjs, extractWithPdfParse];
+  // Try each layer in order; stop as soon as one yields ≥ 50 meaningful chars
+  const layers = [
+    extractBuiltin,       // /Length-based, zlib — reliable on any Node.js env
+    extractRawBtEt,       // BT/ET scan on raw binary — catches uncompressed text
+    extractWithPdfjs,     // pdfjs-dist — robust XRef recovery
+    extractWithPdfParse,  // pdf-parse — legacy fallback
+  ];
 
   let text = '';
   for (const extract of layers) {
@@ -207,7 +208,7 @@ export async function processPDF(
   }
 
   // All layers failed — scanned / image-only PDF.
-  // openai.ts sends a graceful notice instead of crashing the Vision API.
+  // openai.ts sends a graceful text notice rather than crashing the Vision API.
   return {
     type:     'image',
     content:  fileBuffer.toString('base64'),
@@ -231,7 +232,7 @@ export async function processUploadedFile(
   isMultiFile = false,
 ): Promise<ProcessedFile> {
   const charLimit = isMultiFile ? MULTI_FILE_CHAR_LIMIT : SINGLE_FILE_CHAR_LIMIT;
-  if (mimeType === 'application/pdf')  return processPDF(fileBuffer, fileName, charLimit);
-  if (mimeType.startsWith('image/'))   return processImage(fileBuffer, mimeType, fileName);
+  if (mimeType === 'application/pdf') return processPDF(fileBuffer, fileName, charLimit);
+  if (mimeType.startsWith('image/'))  return processImage(fileBuffer, mimeType, fileName);
   throw new Error(`Unsupported file type: ${mimeType}`);
 }
