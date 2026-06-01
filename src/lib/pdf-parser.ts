@@ -1,5 +1,7 @@
 import { ProcessedFile } from '@/types';
 import { inflateSync, inflateRawSync } from 'zlib';
+import * as pdfjsDist from 'pdfjs-dist/legacy/build/pdf.js';
+import pdfParse from 'pdf-parse';
 
 // Per-file token budget when multiple files are submitted
 const SINGLE_FILE_CHAR_LIMIT = 12000;
@@ -140,9 +142,7 @@ async function extractRawBtEt(buffer: Buffer): Promise<string> {
 // ─────────────────────────────────────────────────────────────────────────────
 async function extractWithPdfjs(buffer: Buffer): Promise<string> {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const mod   = await import('pdfjs-dist/legacy/build/pdf.js') as any;
-    const pdfjs = mod.default ?? mod;
+    const pdfjs = (pdfjsDist as any).default ?? pdfjsDist;
     if (typeof pdfjs?.getDocument !== 'function') return '';
 
     pdfjs.GlobalWorkerOptions.workerSrc = '';
@@ -169,7 +169,6 @@ async function extractWithPdfjs(buffer: Buffer): Promise<string> {
 // ─────────────────────────────────────────────────────────────────────────────
 async function extractWithPdfParse(buffer: Buffer): Promise<string> {
   try {
-    const pdfParse = (await import('pdf-parse')).default;
     const data     = await pdfParse(buffer, { max: 50 });
     return data.text.trim();
   } catch {
